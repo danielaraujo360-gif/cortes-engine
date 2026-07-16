@@ -66,44 +66,54 @@ class PrepareClipsRequest(BaseModel):
     video_url: str
 
 
+def _is_youtube_url(url: str) -> bool:
+    return "youtube.com" in url or "youtu.be" in url
+
+
 def _run_prepare_job(job_id: str, video_url: str) -> None:
     workdir = tempfile.mkdtemp(prefix="clips_prepare_")
     try:
-        outtmpl = os.path.join(workdir, "source.%(ext)s")
-        ydl_opts = {
-            "outtmpl": outtmpl,
-            "format": "best",
-            "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-        }
-        cookies_path = _get_youtube_cookies_path()
-        if cookies_path:
-            ydl_opts["cookiefile"] = cookies_path
-        if POT_PROVIDER_URL:
-            ydl_opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}}
+        if _is_youtube_url(video_url):
+            outtmpl = os.path.join(workdir, "source.%(ext)s")
+            ydl_opts = {
+                "outtmpl": outtmpl,
+                "format": "best",
+                "merge_output_format": "mp4",
+                "quiet": True,
+                "no_warnings": True,
+            }
+            cookies_path = _get_youtube_cookies_path()
+            if cookies_path:
+                ydl_opts["cookiefile"] = cookies_path
+            if POT_PROVIDER_URL:
+                ydl_opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}}
 
-        # YouTube's anti-bot format-serving is flaky right now (SABR streaming rollout) --
-        # success rate varies attempt to attempt with no change in request. Retry a few
-        # times before giving up rather than failing on the first unlucky attempt.
-        last_error: Optional[Exception] = None
-        for attempt in range(5):
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([video_url])
-                last_error = None
-                break
-            except yt_dlp.utils.DownloadError as e:
-                last_error = e
-                time.sleep(3)
-                continue
-        if last_error is not None:
-            raise RuntimeError(f"yt-dlp failed after retries: {last_error}")
+            # YouTube's anti-bot format-serving is flaky right now (SABR streaming rollout) --
+            # success rate varies attempt to attempt with no change in request. Retry a few
+            # times before giving up rather than failing on the first unlucky attempt.
+            last_error: Optional[Exception] = None
+            for attempt in range(5):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([video_url])
+                    last_error = None
+                    break
+                except yt_dlp.utils.DownloadError as e:
+                    last_error = e
+                    time.sleep(3)
+                    continue
+            if last_error is not None:
+                raise RuntimeError(f"yt-dlp failed after retries: {last_error}")
 
-        candidates = [f for f in os.listdir(workdir) if f.startswith("source.")]
-        if not candidates:
-            raise RuntimeError("yt-dlp did not produce an output file")
-        source_path = os.path.join(workdir, candidates[0])
+            candidates = [f for f in os.listdir(workdir) if f.startswith("source.")]
+            if not candidates:
+                raise RuntimeError("yt-dlp did not produce an output file")
+            source_path = os.path.join(workdir, candidates[0])
+        else:
+            # Video already hosted somewhere we control (e.g. manually uploaded to
+            # Supabase Storage) -- just download it directly, no yt-dlp needed.
+            source_path = os.path.join(workdir, "source" + _guess_ext(video_url))
+            _download(video_url, source_path)
 
         duration = _probe_duration(source_path)
 
