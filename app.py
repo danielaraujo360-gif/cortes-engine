@@ -22,10 +22,20 @@ YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 WIDTH, HEIGHT = 1080, 1920
-CAPTION_WORDS_PER_LINE = 4
-CAPTION_FONT_SIZE = 90
-CAPTION_HIGHLIGHT_COLOR = "&H0000FFFF"  # ASS BGR: yellow
-CAPTION_BASE_COLOR = "&H00FFFFFF"  # white
+CAPTION_WORDS_PER_LINE = 2
+CAPTION_FONT_SIZE = 130
+CAPTION_BASE_COLOR = "&H00FFFFFF"  # white -- the "not yet spoken" color, always white
+CAPTION_HIGHLIGHT_COLORS = {
+    # ASS BGR format (&H00BBGGRR). Chosen by the highlight-selection LLM per clip mood.
+    "branco": "&H00FFFFFF",
+    "amarelo": "&H0000FFFF",
+    "vermelho": "&H000000FF",
+    "ciano": "&H00FFFF00",
+    "laranja": "&H00008CFF",
+    "rosa": "&H009314FF",
+    "verde": "&H0014FF39",
+}
+DEFAULT_HIGHLIGHT_COLOR = "&H0000FFFF"  # yellow
 
 app = FastAPI()
 _whisper_model: Optional[WhisperModel] = None
@@ -169,6 +179,7 @@ class RenderClipRequest(BaseModel):
     start: float
     end: float
     words: List[dict] = []
+    highlight_color: Optional[str] = None
 
 
 @app.post("/clips/render")
@@ -191,8 +202,11 @@ def clips_render(req: RenderClipRequest, x_api_key: str = Header(default="")):
             for w in req.words
             if w["end"] > req.start and w["start"] < req.end
         ]
+        highlight_color = CAPTION_HIGHLIGHT_COLORS.get(
+            (req.highlight_color or "").strip().lower(), DEFAULT_HIGHLIGHT_COLOR
+        )
         with open(ass_path, "w", encoding="utf-8") as f:
-            f.write(_build_ass_karaoke(relative_words))
+            f.write(_build_ass_karaoke(relative_words, highlight_color))
 
         # Simple v1 reframing: scale to fill the vertical frame height, then center-crop the
         # width. No active-speaker tracking yet -- that's the planned next iteration.
@@ -234,7 +248,7 @@ def _seconds_to_ass_time(t: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _build_ass_karaoke(words: list[dict]) -> str:
+def _build_ass_karaoke(words: list[dict], highlight_color: str = DEFAULT_HIGHLIGHT_COLOR) -> str:
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -244,7 +258,7 @@ def _build_ass_karaoke(words: list[dict]) -> str:
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Karaoke,Poppins,{CAPTION_FONT_SIZE},{CAPTION_HIGHLIGHT_COLOR},{CAPTION_BASE_COLOR},"
+        f"Style: Karaoke,Poppins,{CAPTION_FONT_SIZE},{highlight_color},{CAPTION_BASE_COLOR},"
         "&H00000000,&H00000000,1,0,1,4,2,2,60,60,300,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
