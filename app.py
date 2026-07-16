@@ -127,7 +127,12 @@ def _run_prepare_job(job_id: str, video_url: str) -> None:
             for w in (seg.words or []):
                 words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
 
-        source_url = _upload_to_supabase(source_path, folder="cortes-source/", ext=".mp4", content_type="video/mp4")
+        # If the input was already a file we host (e.g. manually uploaded to
+        # cortes-inbox/), don't re-upload a second copy -- just reuse that URL.
+        if video_url.startswith(SUPABASE_URL):
+            source_url = video_url
+        else:
+            source_url = _upload_to_supabase(source_path, folder="cortes-source/", ext=".mp4", content_type="video/mp4")
         CLIPS_JOBS[job_id] = {
             "status": "done",
             "result": {"source_url": source_url, "duration": duration, "segments": segments, "words": words},
