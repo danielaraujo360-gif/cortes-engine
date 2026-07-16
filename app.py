@@ -19,6 +19,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
 YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 WIDTH, HEIGHT = 1080, 1920
 CAPTION_WORDS_PER_LINE = 4
@@ -53,7 +54,12 @@ def _get_whisper_model() -> WhisperModel:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "youtube_cookies_configured": bool(YOUTUBE_COOKIES_B64), "youtube_cookies_len": len(YOUTUBE_COOKIES_B64)}
+    return {
+        "status": "ok",
+        "youtube_cookies_configured": bool(YOUTUBE_COOKIES_B64),
+        "youtube_cookies_len": len(YOUTUBE_COOKIES_B64),
+        "pot_provider_url": POT_PROVIDER_URL or None,
+    }
 
 
 class PrepareClipsRequest(BaseModel):
@@ -74,6 +80,8 @@ def _run_prepare_job(job_id: str, video_url: str) -> None:
         cookies_path = _get_youtube_cookies_path()
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
+        if POT_PROVIDER_URL:
+            ydl_opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}}
 
         # YouTube's anti-bot format-serving is flaky right now (SABR streaming rollout) --
         # success rate varies attempt to attempt with no change in request. Retry a few
