@@ -42,6 +42,7 @@ app = FastAPI()
 _whisper_model: Optional[WhisperModel] = None
 _youtube_cookies_path: Optional[str] = None
 CLIPS_JOBS: dict = {}
+CLIPS_RENDER_JOBS: dict = {}
 
 
 def _get_youtube_cookies_path() -> Optional[str]:
@@ -183,13 +184,7 @@ class RenderClipRequest(BaseModel):
     highlight_color: Optional[str] = None
 
 
-@app.post("/clips/render")
-def clips_render(req: RenderClipRequest, x_api_key: str = Header(default="")):
-    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    if req.end <= req.start:
-        raise HTTPException(status_code=422, detail="end must be greater than start")
-
+def _run_render_job(job_id: str, req: "RenderClipRequest") -> None:
     workdir = tempfile.mkdtemp(prefix="clips_render_")
     try:
         source_path = os.path.join(workdir, "source" + _guess_ext(req.video_url))
@@ -224,17 +219,37 @@ def clips_render(req: RenderClipRequest, x_api_key: str = Header(default="")):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"ffmpeg (clip render) failed: {result.stderr[-2000:]}")
+            raise RuntimeError(f"ffmpeg (clip render) failed: {result.stderr[-2000:]}")
 
         video_url = _upload_to_supabase(output_path, folder="cortes/", ext=".mp4", content_type="video/mp4")
-        shutil.rmtree(workdir, ignore_errors=True)
-        return {"video_url": video_url}
-    except HTTPException:
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise
+        CLIPS_RENDER_JOBS[job_id] = {"status": "done", "result": {"video_url": video_url}}
     except Exception as e:
+        CLIPS_RENDER_JOBS[job_id] = {"status": "error", "error": str(e)}
+    finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/clips/render")
+def clips_render(req: RenderClipRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if req.end <= req.start:
+        raise HTTPException(status_code=422, detail="end must be greater than start")
+
+    job_id = uuid.uuid4().hex
+    CLIPS_RENDER_JOBS[job_id] = {"status": "processing"}
+    threading.Thread(target=_run_render_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/clips/render-status/{job_id}")
+def clips_render_status(job_id: str, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    job = CLIPS_RENDER_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 
 def _seconds_to_ass_time(t: float) -> str:
