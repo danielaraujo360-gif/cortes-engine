@@ -18,6 +18,7 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "reels")
+KNOWN_HOSTED_PREFIXES = (SUPABASE_URL, "https://pub-66667b109a704a8f8f0a89c4f2ce426d.r2.dev")
 YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
@@ -139,7 +140,7 @@ def _run_prepare_job(job_id: str, video_url: str) -> None:
 
         # If the input was already a file we host (e.g. manually uploaded to
         # cortes-inbox/), don't re-upload a second copy -- just reuse that URL.
-        if video_url.startswith(SUPABASE_URL):
+        if video_url.startswith(KNOWN_HOSTED_PREFIXES):
             source_url = video_url
         else:
             source_url = _upload_to_supabase(source_path, folder="cortes-source/", ext=".mp4", content_type="video/mp4")
