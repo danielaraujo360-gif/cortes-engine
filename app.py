@@ -71,6 +71,7 @@ def health():
         "youtube_cookies_configured": bool(YOUTUBE_COOKIES_B64),
         "youtube_cookies_len": len(YOUTUBE_COOKIES_B64),
         "pot_provider_url": POT_PROVIDER_URL or None,
+        "whisper_model_size": WHISPER_MODEL_SIZE,
     }
 
 
