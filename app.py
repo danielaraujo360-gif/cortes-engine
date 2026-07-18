@@ -43,6 +43,7 @@ _whisper_model: Optional[WhisperModel] = None
 _youtube_cookies_path: Optional[str] = None
 CLIPS_JOBS: dict = {}
 CLIPS_RENDER_JOBS: dict = {}
+STORY_JOBS: dict = {}
 
 
 def _get_youtube_cookies_path() -> Optional[str]:
@@ -339,3 +340,112 @@ def _probe_duration(path: str) -> float:
     if result.returncode != 0 or not result.stdout.strip():
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {result.stderr[-500:]}")
     return float(result.stdout.strip())
+
+
+class StoryRenderRequest(BaseModel):
+    audio_url: str
+    image_urls: List[str]
+    highlight_color: Optional[str] = None
+
+
+def _render_ken_burns_segment(image_path: str, out_path: str, seg_duration: float) -> None:
+    zoom_w, zoom_h = WIDTH * 2, HEIGHT * 2
+    total_frames = max(1, int(round(seg_duration * 30)))
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", image_path,
+        "-vf",
+        f"scale={zoom_w}:{zoom_h}:force_original_aspect_ratio=increase,"
+        f"crop={zoom_w}:{zoom_h},"
+        f"zoompan=z='min(zoom+0.0015,1.3)':d={total_frames}:"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={WIDTH}x{HEIGHT}:fps=30,"
+        "setsar=1",
+        "-t", str(seg_duration),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg (ken burns segment) failed: {result.stderr[-1500:]}")
+
+
+def _run_story_job(job_id: str, req: "StoryRenderRequest") -> None:
+    workdir = tempfile.mkdtemp(prefix="story_render_")
+    try:
+        audio_path = os.path.join(workdir, "narration" + _guess_ext(req.audio_url))
+        _download(req.audio_url, audio_path)
+        duration = _probe_duration(audio_path)
+
+        model = _get_whisper_model()
+        raw_segments, _ = model.transcribe(audio_path, word_timestamps=True, vad_filter=True)
+        words = []
+        for seg in raw_segments:
+            for w in (seg.words or []):
+                words.append({"word": w.word.strip(), "start": w.start, "end": w.end})
+
+        n = len(req.image_urls)
+        seg_duration = max(0.5, duration / n)
+        segment_paths = []
+        for i, url in enumerate(req.image_urls):
+            img_path = os.path.join(workdir, f"scene_{i}.jpg")
+            _download(url, img_path)
+            seg_path = os.path.join(workdir, f"scene_seg_{i}.mp4")
+            _render_ken_burns_segment(img_path, seg_path, seg_duration)
+            segment_paths.append(seg_path)
+
+        concat_list_path = os.path.join(workdir, "concat_list.txt")
+        with open(concat_list_path, "w") as f:
+            for p in segment_paths:
+                f.write(f"file '{p}'\n")
+
+        ass_path = os.path.join(workdir, "captions.ass")
+        highlight_color = CAPTION_HIGHLIGHT_COLORS.get(
+            (req.highlight_color or "").strip().lower(), DEFAULT_HIGHLIGHT_COLOR
+        )
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(_build_ass_karaoke(words, highlight_color))
+
+        output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-i", audio_path,
+            "-vf", f"subtitles={ass_path}:fontsdir=/app/fonts",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg (story final) failed: {result.stderr[-2000:]}")
+
+        video_url = _upload_to_supabase(output_path, folder="story/", ext=".mp4", content_type="video/mp4")
+        STORY_JOBS[job_id] = {"status": "done", "result": {"video_url": video_url, "duration": duration}}
+    except Exception as e:
+        STORY_JOBS[job_id] = {"status": "error", "error": str(e)}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/story/render")
+def story_render(req: StoryRenderRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if not req.image_urls:
+        raise HTTPException(status_code=422, detail="image_urls is required")
+
+    job_id = uuid.uuid4().hex
+    STORY_JOBS[job_id] = {"status": "processing"}
+    threading.Thread(target=_run_story_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/story/render-status/{job_id}")
+def story_render_status(job_id: str, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    job = STORY_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
