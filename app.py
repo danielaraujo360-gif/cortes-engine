@@ -12,6 +12,7 @@ import requests
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException
 from faster_whisper import WhisperModel
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel
 
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
@@ -23,6 +24,8 @@ YOUTUBE_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 WIDTH, HEIGHT = 1080, 1920
+THUMB_FONT_PATH = "/app/fonts/Poppins-Bold.ttf"
+THUMB_FONT_SIZE = 110
 CAPTION_WORDS_PER_LINE = 2
 CAPTION_FONT_SIZE = 130
 CAPTION_BASE_COLOR = "&H00FFFFFF"  # white -- the "not yet spoken" color, always white
@@ -497,3 +500,72 @@ def story_render_status(job_id: str, x_api_key: str = Header(default="")):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+class ThumbnailRequest(BaseModel):
+    image_url: str
+    title: str
+
+
+def _wrap_text(draw: "ImageDraw.ImageDraw", text: str, font: "ImageFont.FreeTypeFont", max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        trial = " ".join(current + [word])
+        if not current or draw.textlength(trial, font=font) <= max_width:
+            current.append(word)
+        else:
+            lines.append(" ".join(current))
+            current = [word]
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+
+def _build_thumbnail(image_path: str, title: str, out_path: str) -> None:
+    img = ImageOps.fit(Image.open(image_path).convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS)
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(THUMB_FONT_PATH, THUMB_FONT_SIZE)
+    max_width = int(WIDTH * 0.88)
+    lines = _wrap_text(draw, title.upper(), font, max_width)
+
+    ref_bbox = font.getbbox("Ág")
+    line_height = (ref_bbox[3] - ref_bbox[1]) + 28
+    total_height = line_height * len(lines)
+    y = HEIGHT - total_height - 160
+    band_top = y - 50
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).rectangle([0, band_top, WIDTH, HEIGHT], fill=(0, 0, 0, 150))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    for line in lines:
+        w = draw.textlength(line, font=font)
+        x = (WIDTH - w) / 2
+        draw.text((x, y), line, font=font, fill="white", stroke_width=7, stroke_fill="black")
+        y += line_height
+
+    img.save(out_path, "JPEG", quality=92)
+
+
+@app.post("/story/thumbnail")
+def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    workdir = tempfile.mkdtemp(prefix="thumb_")
+    try:
+        image_path = os.path.join(workdir, "cover" + _guess_ext(req.image_url))
+        _download_image_with_retry(req.image_url, image_path)
+        out_path = os.path.join(workdir, f"{uuid.uuid4().hex}.jpg")
+        _build_thumbnail(image_path, req.title, out_path)
+        thumbnail_url = _upload_to_supabase(out_path, folder="thumbs-biblia/", ext=".jpg", content_type="image/jpeg")
+        return {"thumbnail_url": thumbnail_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
