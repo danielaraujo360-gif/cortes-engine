@@ -573,8 +573,9 @@ def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
 
 ASSETS_DIR = "/app/assets"
 SATISFYING_CLIP_SECONDS = 14.0
-CHECKLIST_DISPLAY_SECONDS = 1.6
-SUBSCRIBE_DISPLAY_SECONDS = 2.5
+SUBSCRIBE_START_SECONDS = 2.0
+SUBSCRIBE_NORMAL_SECONDS = 1.2
+SUBSCRIBE_CLICKED_SECONDS = 1.0
 
 SATISFYING_JOBS: dict = {}
 
@@ -623,31 +624,46 @@ def _trim_and_reframe_clip(src_path: str, out_path: str) -> float:
 
 
 def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_clips: int) -> str:
+    # Checklist: box i stays visible for that clip's entire screen time (not a brief
+    # pop-in), as a persistent vertical sidebar -- the actual position/orientation
+    # lives in the checklist_N.png assets themselves, this just controls timing.
     filter_parts = []
     prev_label = "0:v"
     for i in range(n_clips):
         t0 = cum_times[i]
+        t1 = cum_times[i + 1] if i + 1 < n_clips else total_duration
         out_label = f"v{i + 1}"
         filter_parts.append(
-            f"[{prev_label}][{i + 1}:v]overlay=x=0:y=0:enable='between(t,{t0:.2f},{t0 + CHECKLIST_DISPLAY_SECONDS:.2f})'[{out_label}]"
+            f"[{prev_label}][{i + 1}:v]overlay=x=0:y=0:enable='between(t,{t0:.2f},{t1:.2f})'[{out_label}]"
         )
         prev_label = out_label
 
-    subscribe_idx = n_clips + 1
-    sub_t = max(0.0, total_duration / 2 - SUBSCRIBE_DISPLAY_SECONDS / 2)
+    # Subscribe reminder: appears within the first 5s -- normal state, then a
+    # "clicked" state (cursor + ripple) timed with the click SFX below.
+    normal_idx = n_clips + 1
+    clicked_idx = n_clips + 2
+    t_normal_start = SUBSCRIBE_START_SECONDS
+    t_click = t_normal_start + SUBSCRIBE_NORMAL_SECONDS
+    t_clicked_end = t_click + SUBSCRIBE_CLICKED_SECONDS
     filter_parts.append(
-        f"[{prev_label}][{subscribe_idx}:v]overlay=x=0:y=0:enable='between(t,{sub_t:.2f},{sub_t + SUBSCRIBE_DISPLAY_SECONDS:.2f})'[vout]"
+        f"[{prev_label}][{normal_idx}:v]overlay=x=0:y=0:enable='between(t,{t_normal_start:.2f},{t_click:.2f})'[vsub1]"
+    )
+    filter_parts.append(
+        f"[vsub1][{clicked_idx}:v]overlay=x=0:y=0:enable='between(t,{t_click:.2f},{t_clicked_end:.2f})'[vout]"
     )
 
-    click_idx = subscribe_idx + 1
+    click_idx = clicked_idx + 1
     whoosh_idx = click_idx + 1
     audio_parts = []
 
-    click_labels = [f"[click{i}]" for i in range(n_clips)]
-    audio_parts.append(f"[{click_idx}:a]asplit={n_clips}" + "".join(click_labels))
+    # One click SFX per clip-start (checklist tick) plus one more for the subscribe click.
+    click_times = list(cum_times[:n_clips]) + [t_click]
+    n_clicks = len(click_times)
+    click_labels = [f"[click{i}]" for i in range(n_clicks)]
+    audio_parts.append(f"[{click_idx}:a]asplit={n_clicks}" + "".join(click_labels))
     click_delayed = []
-    for i in range(n_clips):
-        ms = int(cum_times[i] * 1000)
+    for i, t in enumerate(click_times):
+        ms = int(t * 1000)
         audio_parts.append(f"[click{i}]adelay={ms}|{ms}[clickd{i}]")
         click_delayed.append(f"[clickd{i}]")
 
@@ -703,7 +719,8 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
         cmd = ["ffmpeg", "-y", "-i", combined_path]
         for i in range(1, 6):
             cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, f"checklist_{i}.png")]
-        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe.png")]
+        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe_normal.png")]
+        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe_clicked.png")]
         cmd += ["-i", os.path.join(ASSETS_DIR, "click.m4a")]
         cmd += ["-i", os.path.join(ASSETS_DIR, "whoosh.m4a")]
         cmd += [
