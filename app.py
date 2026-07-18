@@ -569,3 +569,181 @@ def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+ASSETS_DIR = "/app/assets"
+SATISFYING_CLIP_SECONDS = 14.0
+CHECKLIST_DISPLAY_SECONDS = 1.6
+SUBSCRIBE_DISPLAY_SECONDS = 2.5
+
+SATISFYING_JOBS: dict = {}
+
+
+class SatisfyingRenderRequest(BaseModel):
+    video_urls: List[str]
+
+
+def _has_audio_stream(path: str) -> bool:
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=codec_type", "-of", "csv=p=0", path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0 and "audio" in result.stdout
+
+
+def _trim_and_reframe_clip(src_path: str, out_path: str) -> float:
+    duration = _probe_duration(src_path)
+    clip_len = min(SATISFYING_CLIP_SECONDS, duration)
+    start = max(0.0, (duration - clip_len) / 2)
+
+    vf = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1"
+    if _has_audio_stream(src_path):
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", src_path, "-t", str(clip_len),
+            "-vf", vf,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            out_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-i", src_path,
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-t", str(clip_len),
+            "-vf", vf,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-shortest",
+            out_path,
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg (trim clip) failed: {result.stderr[-1500:]}")
+    return clip_len
+
+
+def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_clips: int) -> str:
+    filter_parts = []
+    prev_label = "0:v"
+    for i in range(n_clips):
+        t0 = cum_times[i]
+        out_label = f"v{i + 1}"
+        filter_parts.append(
+            f"[{prev_label}][{i + 1}:v]overlay=x=0:y=0:enable='between(t,{t0:.2f},{t0 + CHECKLIST_DISPLAY_SECONDS:.2f})'[{out_label}]"
+        )
+        prev_label = out_label
+
+    subscribe_idx = n_clips + 1
+    sub_t = max(0.0, total_duration / 2 - SUBSCRIBE_DISPLAY_SECONDS / 2)
+    filter_parts.append(
+        f"[{prev_label}][{subscribe_idx}:v]overlay=x=0:y=0:enable='between(t,{sub_t:.2f},{sub_t + SUBSCRIBE_DISPLAY_SECONDS:.2f})'[vout]"
+    )
+
+    click_idx = subscribe_idx + 1
+    whoosh_idx = click_idx + 1
+    audio_parts = []
+
+    click_labels = [f"[click{i}]" for i in range(n_clips)]
+    audio_parts.append(f"[{click_idx}:a]asplit={n_clips}" + "".join(click_labels))
+    click_delayed = []
+    for i in range(n_clips):
+        ms = int(cum_times[i] * 1000)
+        audio_parts.append(f"[click{i}]adelay={ms}|{ms}[clickd{i}]")
+        click_delayed.append(f"[clickd{i}]")
+
+    n_transitions = n_clips - 1
+    whoosh_delayed = []
+    if n_transitions > 0:
+        whoosh_labels = [f"[whoosh{i}]" for i in range(n_transitions)]
+        audio_parts.append(f"[{whoosh_idx}:a]asplit={n_transitions}" + "".join(whoosh_labels))
+        for i in range(n_transitions):
+            ms = int(cum_times[i + 1] * 1000)
+            audio_parts.append(f"[whoosh{i}]adelay={ms}|{ms}[whooshd{i}]")
+            whoosh_delayed.append(f"[whooshd{i}]")
+
+    all_inputs = "[0:a]" + "".join(click_delayed) + "".join(whoosh_delayed)
+    total_inputs = 1 + len(click_delayed) + len(whoosh_delayed)
+    audio_parts.append(f"{all_inputs}amix=inputs={total_inputs}:duration=first:dropout_transition=0[aout]")
+
+    return ";".join(filter_parts + audio_parts)
+
+
+def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
+    workdir = tempfile.mkdtemp(prefix="satisfying_")
+    try:
+        n_clips = len(req.video_urls)
+        clip_paths = []
+        clip_durations = []
+        for i, url in enumerate(req.video_urls):
+            src_path = os.path.join(workdir, f"src_{i}" + _guess_ext(url))
+            _download_image_with_retry(url, src_path)
+            seg_path = os.path.join(workdir, f"clip_{i}.mp4")
+            clip_len = _trim_and_reframe_clip(src_path, seg_path)
+            clip_paths.append(seg_path)
+            clip_durations.append(clip_len)
+
+        cum_times = [0.0]
+        for d in clip_durations[:-1]:
+            cum_times.append(cum_times[-1] + d)
+        total_duration = sum(clip_durations)
+
+        concat_list_path = os.path.join(workdir, "concat_list.txt")
+        with open(concat_list_path, "w") as f:
+            for p in clip_paths:
+                f.write(f"file '{p}'\n")
+        combined_path = os.path.join(workdir, "combined.mp4")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", combined_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg (concat) failed: {result.stderr[-1500:]}")
+
+        filter_complex = _build_satisfying_filter(cum_times, total_duration, n_clips)
+
+        output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
+        cmd = ["ffmpeg", "-y", "-i", combined_path]
+        for i in range(1, 6):
+            cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, f"checklist_{i}.png")]
+        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe.png")]
+        cmd += ["-i", os.path.join(ASSETS_DIR, "click.m4a")]
+        cmd += ["-i", os.path.join(ASSETS_DIR, "whoosh.m4a")]
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-b:a", "128k",
+            "-t", str(total_duration),
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg (satisfying final) failed: {result.stderr[-2000:]}")
+
+        video_url = _upload_to_supabase(output_path, folder="satisfatorios/", ext=".mp4", content_type="video/mp4")
+        SATISFYING_JOBS[job_id] = {"status": "done", "result": {"video_url": video_url, "duration": total_duration}}
+    except Exception as e:
+        SATISFYING_JOBS[job_id] = {"status": "error", "error": str(e)}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/satisfying/render")
+def satisfying_render(req: SatisfyingRenderRequest, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if len(req.video_urls) != 5:
+        raise HTTPException(status_code=422, detail="exactly 5 video_urls are required")
+
+    job_id = uuid.uuid4().hex
+    SATISFYING_JOBS[job_id] = {"status": "processing"}
+    threading.Thread(target=_run_satisfying_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/satisfying/render-status/{job_id}")
+def satisfying_render_status(job_id: str, x_api_key: str = Header(default="")):
+    if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    job = SATISFYING_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
