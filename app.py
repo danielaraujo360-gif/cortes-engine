@@ -329,9 +329,10 @@ def _download(url: str, dest: str) -> None:
             f.write(chunk)
 
 
-def _download_image_with_retry(url: str, dest: str, attempts: int = 4) -> None:
-    # Pollinations' free tier rate-limits bursts of requests (429) -- back off and retry
-    # rather than failing the whole render over a transient rate limit.
+def _download_image_with_retry(url: str, dest: str, attempts: int = 5) -> None:
+    # Pollinations' free tier rate-limits bursts of requests (429) and is occasionally
+    # flaky (timeouts, connection resets, transient 5xx) -- back off and retry rather
+    # than failing the whole render over what's usually a one-off hiccup.
     last_error: Optional[Exception] = None
     for attempt in range(attempts):
         try:
@@ -339,10 +340,15 @@ def _download_image_with_retry(url: str, dest: str, attempts: int = 4) -> None:
             return
         except requests.exceptions.HTTPError as e:
             last_error = e
-            if e.response is not None and e.response.status_code == 429:
+            status = e.response.status_code if e.response is not None else None
+            if status == 429 or (status is not None and status >= 500):
                 time.sleep(5 * (attempt + 1))
                 continue
             raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            time.sleep(5 * (attempt + 1))
+            continue
     raise last_error
 
 
