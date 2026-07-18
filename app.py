@@ -573,9 +573,10 @@ def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
 
 ASSETS_DIR = "/app/assets"
 SATISFYING_CLIP_SECONDS = 14.0
-SUBSCRIBE_START_SECONDS = 2.0
-SUBSCRIBE_NORMAL_SECONDS = 1.2
-SUBSCRIBE_CLICKED_SECONDS = 1.0
+SUBSCRIBE_START_SECONDS = 0.0  # keep at 0 -- the greenscreen clip and main video decode
+# in lockstep from their own t=0, so a nonzero offset here would desync the overlay
+# window from the greenscreen clip's own content (see _build_satisfying_filter)
+SUBSCRIBE_CHROMA_COLOR = "0x26FF11"
 
 SATISFYING_JOBS: dict = {}
 
@@ -623,7 +624,7 @@ def _trim_and_reframe_clip(src_path: str, out_path: str) -> float:
     return clip_len
 
 
-def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_clips: int) -> str:
+def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_clips: int, subscribe_duration: float) -> str:
     # Checklist: box i stays visible for that clip's entire screen time (not a brief
     # pop-in), as a persistent vertical sidebar -- the actual position/orientation
     # lives in the checklist_N.png assets themselves, this just controls timing.
@@ -638,26 +639,25 @@ def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_cl
         )
         prev_label = out_label
 
-    # Subscribe reminder: appears within the first 5s -- normal state, then a
-    # "clicked" state (cursor + ripple) timed with the click SFX below.
-    normal_idx = n_clips + 1
-    clicked_idx = n_clips + 2
-    t_normal_start = SUBSCRIBE_START_SECONDS
-    t_click = t_normal_start + SUBSCRIBE_NORMAL_SECONDS
-    t_clicked_end = t_click + SUBSCRIBE_CLICKED_SECONDS
+    # Subscribe reminder: a real chroma-keyed video clip (user-supplied, pre-animated
+    # cursor click + payoff effect and its own baked-in click SFX), overlaid within
+    # the first few seconds instead of the hand-drawn two-frame PNG swap this replaced.
+    subscribe_idx = n_clips + 1
+    t_sub_start = SUBSCRIBE_START_SECONDS
+    t_sub_end = t_sub_start + subscribe_duration
+    filter_parts.append(f"[{subscribe_idx}:v]scale={WIDTH}:{HEIGHT}[subscaled]")
+    filter_parts.append(f"[subscaled]chromakey={SUBSCRIBE_CHROMA_COLOR}:0.15:0.05[subkeyed]")
     filter_parts.append(
-        f"[{prev_label}][{normal_idx}:v]overlay=x=0:y=0:enable='between(t,{t_normal_start:.2f},{t_click:.2f})'[vsub1]"
-    )
-    filter_parts.append(
-        f"[vsub1][{clicked_idx}:v]overlay=x=0:y=0:enable='between(t,{t_click:.2f},{t_clicked_end:.2f})'[vout]"
+        f"[{prev_label}][subkeyed]overlay=x=0:y=0:enable='between(t,{t_sub_start:.2f},{t_sub_end:.2f})'[vout]"
     )
 
-    click_idx = clicked_idx + 1
+    click_idx = subscribe_idx + 1
     whoosh_idx = click_idx + 1
     audio_parts = []
 
-    # One click SFX per clip-start (checklist tick) plus one more for the subscribe click.
-    click_times = list(cum_times[:n_clips]) + [t_click]
+    # One click SFX per clip-start (checklist tick). The subscribe moment's sound
+    # comes from the greenscreen clip's own audio track, mixed in separately below.
+    click_times = list(cum_times[:n_clips])
     n_clicks = len(click_times)
     click_labels = [f"[click{i}]" for i in range(n_clicks)]
     audio_parts.append(f"[{click_idx}:a]asplit={n_clicks}" + "".join(click_labels))
@@ -677,8 +677,11 @@ def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_cl
             audio_parts.append(f"[whoosh{i}]adelay={ms}|{ms}[whooshd{i}]")
             whoosh_delayed.append(f"[whooshd{i}]")
 
-    all_inputs = "[0:a]" + "".join(click_delayed) + "".join(whoosh_delayed)
-    total_inputs = 1 + len(click_delayed) + len(whoosh_delayed)
+    sub_ms = int(t_sub_start * 1000)
+    audio_parts.append(f"[{subscribe_idx}:a]adelay={sub_ms}|{sub_ms}[subaudiod]")
+
+    all_inputs = "[0:a]" + "".join(click_delayed) + "".join(whoosh_delayed) + "[subaudiod]"
+    total_inputs = 1 + len(click_delayed) + len(whoosh_delayed) + 1
     audio_parts.append(f"{all_inputs}amix=inputs={total_inputs}:duration=first:dropout_transition=0[aout]")
 
     return ";".join(filter_parts + audio_parts)
@@ -713,14 +716,15 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg (concat) failed: {result.stderr[-1500:]}")
 
-        filter_complex = _build_satisfying_filter(cum_times, total_duration, n_clips)
+        subscribe_path = os.path.join(ASSETS_DIR, "subscribe_greenscreen.mp4")
+        subscribe_duration = _probe_duration(subscribe_path)
+        filter_complex = _build_satisfying_filter(cum_times, total_duration, n_clips, subscribe_duration)
 
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
         cmd = ["ffmpeg", "-y", "-i", combined_path]
         for i in range(1, 6):
             cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, f"checklist_{i}.png")]
-        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe_normal.png")]
-        cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, "subscribe_clicked.png")]
+        cmd += ["-i", subscribe_path]
         cmd += ["-i", os.path.join(ASSETS_DIR, "click.m4a")]
         cmd += ["-i", os.path.join(ASSETS_DIR, "whoosh.m4a")]
         cmd += [
