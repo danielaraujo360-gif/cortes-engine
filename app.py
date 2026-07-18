@@ -1,4 +1,5 @@
 import base64
+import math
 import os
 import shutil
 import subprocess
@@ -572,143 +573,71 @@ def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
 
 
 ASSETS_DIR = "/app/assets"
-SATISFYING_CLIP_SECONDS = 14.0
-SUBSCRIBE_START_SECONDS = 0.0  # keep at 0 -- the greenscreen clip and main video decode
-# in lockstep from their own t=0, so a nonzero offset here would desync the overlay
-# window from the greenscreen clip's own content (see _build_satisfying_filter)
+BACKGROUND_SEGMENT_SECONDS = 10.0  # background clips are cycled in chunks this long
+NARRATION_SPEED = 1.3
+LIKE_DISPLAY_SECONDS = 3.0
+SUBSCRIBE_DISPLAY_SECONDS = 10.0
+LIKE_CHROMA_COLOR = "0x00F90E"
 SUBSCRIBE_CHROMA_COLOR = "0x26FF11"
 
 SATISFYING_JOBS: dict = {}
 
 
 class SatisfyingRenderRequest(BaseModel):
+    narration_url: str
     video_urls: List[str]
 
 
-def _has_audio_stream(path: str) -> bool:
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=codec_type", "-of", "csv=p=0", path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode == 0 and "audio" in result.stdout
-
-
-def _trim_and_reframe_clip(src_path: str, out_path: str) -> float:
-    duration = _probe_duration(src_path)
-    clip_len = min(SATISFYING_CLIP_SECONDS, duration)
-    start = max(0.0, (duration - clip_len) / 2)
-
-    vf = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1"
-    if _has_audio_stream(src_path):
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(start), "-i", src_path, "-t", str(clip_len),
-            "-vf", vf,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            out_path,
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(start), "-i", src_path,
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-t", str(clip_len),
-            "-vf", vf,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-shortest",
-            out_path,
-        ]
+def _speed_up_audio(src_path: str, out_path: str, speed: float) -> float:
+    cmd = ["ffmpeg", "-y", "-i", src_path, "-filter:a", f"atempo={speed}", "-vn", out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg (trim clip) failed: {result.stderr[-1500:]}")
-    return clip_len
+        raise RuntimeError(f"ffmpeg (speed up narration) failed: {result.stderr[-1500:]}")
+    return _probe_duration(out_path)
 
 
-def _build_satisfying_filter(cum_times: list[float], total_duration: float, n_clips: int, subscribe_duration: float) -> str:
-    # Checklist: box i stays visible for that clip's entire screen time (not a brief
-    # pop-in), as a persistent vertical sidebar -- the actual position/orientation
-    # lives in the checklist_N.png assets themselves, this just controls timing.
-    filter_parts = []
-    prev_label = "0:v"
-    for i in range(n_clips):
-        t0 = cum_times[i]
-        t1 = cum_times[i + 1] if i + 1 < n_clips else total_duration
-        out_label = f"v{i + 1}"
-        filter_parts.append(
-            f"[{prev_label}][{i + 1}:v]overlay=x=0:y=0:enable='between(t,{t0:.2f},{t1:.2f})'[{out_label}]"
-        )
-        prev_label = out_label
-
-    # Subscribe reminder: a real chroma-keyed video clip (user-supplied, pre-animated
-    # cursor click + payoff effect and its own baked-in click SFX), overlaid within
-    # the first few seconds instead of the hand-drawn two-frame PNG swap this replaced.
-    subscribe_idx = n_clips + 1
-    t_sub_start = SUBSCRIBE_START_SECONDS
-    t_sub_end = t_sub_start + subscribe_duration
-    filter_parts.append(f"[{subscribe_idx}:v]scale={WIDTH}:{HEIGHT}[subscaled]")
-    filter_parts.append(f"[subscaled]chromakey={SUBSCRIBE_CHROMA_COLOR}:0.15:0.05[subkeyed]")
-    filter_parts.append(
-        f"[{prev_label}][subkeyed]overlay=x=0:y=0:enable='between(t,{t_sub_start:.2f},{t_sub_end:.2f})'[vout]"
-    )
-
-    click_idx = subscribe_idx + 1
-    whoosh_idx = click_idx + 1
-    audio_parts = []
-
-    # One click SFX per clip-start (checklist tick). The subscribe moment's sound
-    # comes from the greenscreen clip's own audio track, mixed in separately below.
-    click_times = list(cum_times[:n_clips])
-    n_clicks = len(click_times)
-    click_labels = [f"[click{i}]" for i in range(n_clicks)]
-    audio_parts.append(f"[{click_idx}:a]asplit={n_clicks}" + "".join(click_labels))
-    click_delayed = []
-    for i, t in enumerate(click_times):
-        ms = int(t * 1000)
-        audio_parts.append(f"[click{i}]adelay={ms}|{ms}[clickd{i}]")
-        click_delayed.append(f"[clickd{i}]")
-
-    n_transitions = n_clips - 1
-    whoosh_delayed = []
-    if n_transitions > 0:
-        whoosh_labels = [f"[whoosh{i}]" for i in range(n_transitions)]
-        audio_parts.append(f"[{whoosh_idx}:a]asplit={n_transitions}" + "".join(whoosh_labels))
-        for i in range(n_transitions):
-            ms = int(cum_times[i + 1] * 1000)
-            audio_parts.append(f"[whoosh{i}]adelay={ms}|{ms}[whooshd{i}]")
-            whoosh_delayed.append(f"[whooshd{i}]")
-
-    sub_ms = int(t_sub_start * 1000)
-    audio_parts.append(f"[{subscribe_idx}:a]adelay={sub_ms}|{sub_ms}[subaudiod]")
-
-    all_inputs = "[0:a]" + "".join(click_delayed) + "".join(whoosh_delayed) + "[subaudiod]"
-    total_inputs = 1 + len(click_delayed) + len(whoosh_delayed) + 1
-    audio_parts.append(f"{all_inputs}amix=inputs={total_inputs}:duration=first:dropout_transition=0[aout]")
-
-    return ";".join(filter_parts + audio_parts)
+def _loop_trim_mute_clip(src_path: str, out_path: str, target_duration: float) -> None:
+    # -stream_loop -1 loops the source indefinitely; -t cuts it to the exact length we
+    # need regardless of whether the source is longer or shorter than that -- avoids
+    # having to reason about how many whole loops are "enough."
+    vf = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1"
+    cmd = [
+        "ffmpeg", "-y", "-stream_loop", "-1", "-i", src_path, "-t", str(target_duration),
+        "-vf", vf, "-an",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg (loop/trim background) failed: {result.stderr[-1500:]}")
 
 
 def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
     workdir = tempfile.mkdtemp(prefix="satisfying_")
     try:
-        n_clips = len(req.video_urls)
-        clip_paths = []
-        clip_durations = []
-        for i, url in enumerate(req.video_urls):
-            src_path = os.path.join(workdir, f"src_{i}" + _guess_ext(url))
-            _download_image_with_retry(url, src_path)
-            seg_path = os.path.join(workdir, f"clip_{i}.mp4")
-            clip_len = _trim_and_reframe_clip(src_path, seg_path)
-            clip_paths.append(seg_path)
-            clip_durations.append(clip_len)
+        narration_path = os.path.join(workdir, "narration" + _guess_ext(req.narration_url))
+        _download_image_with_retry(req.narration_url, narration_path)
+        sped_path = os.path.join(workdir, "narration_sped.m4a")
+        total_duration = _speed_up_audio(narration_path, sped_path, NARRATION_SPEED)
 
-        cum_times = [0.0]
-        for d in clip_durations[:-1]:
-            cum_times.append(cum_times[-1] + d)
-        total_duration = sum(clip_durations)
+        # Cycle through the provided background pool in fixed-length muted chunks
+        # until they cover the (sped-up) narration's full duration.
+        n_segments = max(1, math.ceil(total_duration / BACKGROUND_SEGMENT_SECONDS))
+        seg_paths = []
+        elapsed = 0.0
+        for i in range(n_segments):
+            url = req.video_urls[i % len(req.video_urls)]
+            src_path = os.path.join(workdir, f"bgsrc_{i}" + _guess_ext(url))
+            _download_image_with_retry(url, src_path)
+            seg_len = min(BACKGROUND_SEGMENT_SECONDS, total_duration - elapsed)
+            seg_path = os.path.join(workdir, f"bgseg_{i}.mp4")
+            _loop_trim_mute_clip(src_path, seg_path, seg_len)
+            seg_paths.append(seg_path)
+            elapsed += seg_len
 
         concat_list_path = os.path.join(workdir, "concat_list.txt")
         with open(concat_list_path, "w") as f:
-            for p in clip_paths:
+            for p in seg_paths:
                 f.write(f"file '{p}'\n")
         combined_path = os.path.join(workdir, "combined.mp4")
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", combined_path]
@@ -716,20 +645,29 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg (concat) failed: {result.stderr[-1500:]}")
 
+        like_path = os.path.join(ASSETS_DIR, "like_greenscreen.mp4")
         subscribe_path = os.path.join(ASSETS_DIR, "subscribe_greenscreen.mp4")
-        subscribe_duration = _probe_duration(subscribe_path)
-        filter_complex = _build_satisfying_filter(cum_times, total_duration, n_clips, subscribe_duration)
+        t_like_end = LIKE_DISPLAY_SECONDS
+        t_sub_end = t_like_end + SUBSCRIBE_DISPLAY_SECONDS
+
+        filter_complex = (
+            f"[1:v]scale={WIDTH}:{HEIGHT}[likescaled];"
+            f"[likescaled]chromakey={LIKE_CHROMA_COLOR}:0.15:0.05[likekeyed];"
+            f"[2:v]scale={WIDTH}:{HEIGHT}[subscaled];"
+            f"[subscaled]chromakey={SUBSCRIBE_CHROMA_COLOR}:0.15:0.05[subkeyed];"
+            f"[0:v][likekeyed]overlay=x=0:y=0:enable='between(t,0,{t_like_end:.2f})'[v1];"
+            f"[v1][subkeyed]overlay=x=0:y=0:enable='between(t,{t_like_end:.2f},{t_sub_end:.2f})'[vout]"
+        )
 
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
-        cmd = ["ffmpeg", "-y", "-i", combined_path]
-        for i in range(1, 6):
-            cmd += ["-loop", "1", "-i", os.path.join(ASSETS_DIR, f"checklist_{i}.png")]
-        cmd += ["-i", subscribe_path]
-        cmd += ["-i", os.path.join(ASSETS_DIR, "click.m4a")]
-        cmd += ["-i", os.path.join(ASSETS_DIR, "whoosh.m4a")]
-        cmd += [
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", combined_path,
+            "-stream_loop", "-1", "-i", like_path,
+            "-stream_loop", "-1", "-i", subscribe_path,
+            "-i", sped_path,
             "-filter_complex", filter_complex,
-            "-map", "[vout]", "-map", "[aout]",
+            "-map", "[vout]", "-map", "3:a",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
             "-c:a", "aac", "-b:a", "128k",
             "-t", str(total_duration),
@@ -751,8 +689,8 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
 def satisfying_render(req: SatisfyingRenderRequest, x_api_key: str = Header(default="")):
     if RENDER_API_KEY and x_api_key != RENDER_API_KEY:
         raise HTTPException(status_code=401, detail="unauthorized")
-    if len(req.video_urls) != 5:
-        raise HTTPException(status_code=422, detail="exactly 5 video_urls are required")
+    if not req.video_urls:
+        raise HTTPException(status_code=422, detail="at least one video_url is required")
 
     job_id = uuid.uuid4().hex
     SATISFYING_JOBS[job_id] = {"status": "processing"}
