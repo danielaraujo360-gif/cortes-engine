@@ -363,6 +363,7 @@ class StoryRenderRequest(BaseModel):
     audio_url: str
     image_urls: List[str]
     highlight_color: Optional[str] = None
+    music_url: Optional[str] = None
 
 
 def _render_ken_burns_segment(image_path: str, out_path: str, seg_duration: float) -> None:
@@ -425,16 +426,38 @@ def _run_story_job(job_id: str, req: "StoryRenderRequest") -> None:
             f.write(_build_ass_karaoke(words, highlight_color))
 
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_list_path,
-            "-i", audio_path,
-            "-vf", f"subtitles={ass_path}:fontsdir=/app/fonts",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            output_path,
-        ]
+        fade_out_start = max(duration - 1, 0)
+
+        if req.music_url:
+            music_path = os.path.join(workdir, "music" + _guess_ext(req.music_url))
+            _download(req.music_url, music_path)
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
+                "-i", audio_path,
+                "-i", music_path,
+                "-filter_complex",
+                f"[0:v]subtitles={ass_path}:fontsdir=/app/fonts[vout];"
+                f"[2:a]aloop=loop=-1:size=2e9,atrim=0:{duration},volume=0.15,"
+                f"afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start}:d=1[music];"
+                f"[1:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k",
+                "-t", str(duration),
+                output_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
+                "-i", audio_path,
+                "-vf", f"subtitles={ass_path}:fontsdir=/app/fonts",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                output_path,
+            ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg (story final) failed: {result.stderr[-2000:]}")
