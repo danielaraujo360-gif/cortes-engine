@@ -664,7 +664,7 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
             "ffmpeg", "-y",
             "-i", combined_path,
             "-stream_loop", "-1", "-i", like_path,
-            "-stream_loop", "-1", "-i", subscribe_path,
+            "-itsoffset", f"{t_like_end:.2f}", "-stream_loop", "-1", "-i", subscribe_path,
             "-i", sped_path,
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "3:a",
