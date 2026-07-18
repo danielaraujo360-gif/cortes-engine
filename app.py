@@ -575,8 +575,8 @@ def story_thumbnail(req: ThumbnailRequest, x_api_key: str = Header(default="")):
 ASSETS_DIR = "/app/assets"
 BACKGROUND_SEGMENT_SECONDS = 10.0  # background clips are cycled in chunks this long
 NARRATION_SPEED = 1.3
-LIKE_DISPLAY_SECONDS = 3.0
-SUBSCRIBE_DISPLAY_SECONDS = 10.0
+LIKE_DISPLAY_SECONDS = 4.67  # like_greenscreen.mp4's own duration; plays once, no loop/cut
+SUBSCRIBE_DISPLAY_SECONDS = 4.95  # subscribe_greenscreen.mp4's own duration; plays once, no loop/cut
 LIKE_CHROMA_COLOR = "0x00F90E"
 SUBSCRIBE_CHROMA_COLOR = "0x26FF11"
 
@@ -663,8 +663,8 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
         cmd = [
             "ffmpeg", "-y",
             "-i", combined_path,
-            "-stream_loop", "-1", "-i", like_path,
-            "-itsoffset", f"{t_like_end:.2f}", "-stream_loop", "-1", "-i", subscribe_path,
+            "-i", like_path,
+            "-itsoffset", f"{t_like_end:.2f}", "-i", subscribe_path,
             "-i", sped_path,
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "3:a",
