@@ -329,6 +329,23 @@ def _download(url: str, dest: str) -> None:
             f.write(chunk)
 
 
+def _download_image_with_retry(url: str, dest: str, attempts: int = 4) -> None:
+    # Pollinations' free tier rate-limits bursts of requests (429) -- back off and retry
+    # rather than failing the whole render over a transient rate limit.
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            _download(url, dest)
+            return
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if e.response is not None and e.response.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise last_error
+
+
 def _probe_duration(path: str) -> float:
     cmd = [
         "ffprobe", "-v", "error",
@@ -388,10 +405,12 @@ def _run_story_job(job_id: str, req: "StoryRenderRequest") -> None:
         segment_paths = []
         for i, url in enumerate(req.image_urls):
             img_path = os.path.join(workdir, f"scene_{i}.jpg")
-            _download(url, img_path)
+            _download_image_with_retry(url, img_path)
             seg_path = os.path.join(workdir, f"scene_seg_{i}.mp4")
             _render_ken_burns_segment(img_path, seg_path, seg_duration)
             segment_paths.append(seg_path)
+            if i < len(req.image_urls) - 1:
+                time.sleep(3)  # Pollinations' free tier rate-limits rapid back-to-back requests
 
         concat_list_path = os.path.join(workdir, "concat_list.txt")
         with open(concat_list_path, "w") as f:
