@@ -1,6 +1,7 @@
 import base64
 import math
 import os
+import random
 import shutil
 import subprocess
 import tempfile
@@ -580,6 +581,10 @@ SUBSCRIBE_DISPLAY_SECONDS = 4.95  # subscribe_greenscreen.mp4's own duration; pl
 LIKE_CHROMA_COLOR = "0x00F90E"
 SUBSCRIBE_CHROMA_COLOR = "0x26FF11"
 
+MUSIC_DIR = os.path.join(ASSETS_DIR, "music")
+MUSIC_VOLUME = 0.12  # low background bed, stays well under the narration
+MUSIC_FADE_SECONDS = 1.0
+
 SATISFYING_JOBS: dict = {}
 
 
@@ -650,13 +655,20 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
         t_like_end = LIKE_DISPLAY_SECONDS
         t_sub_end = t_like_end + SUBSCRIBE_DISPLAY_SECONDS
 
+        music_files = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(".mp3")]
+        music_path = os.path.join(MUSIC_DIR, random.choice(music_files))
+        fade_out_start = max(0.0, total_duration - MUSIC_FADE_SECONDS)
+
         filter_complex = (
             f"[1:v]scale={WIDTH}:{HEIGHT}[likescaled];"
             f"[likescaled]chromakey={LIKE_CHROMA_COLOR}:0.15:0.05[likekeyed];"
             f"[2:v]scale={WIDTH}:{HEIGHT}[subscaled];"
             f"[subscaled]chromakey={SUBSCRIBE_CHROMA_COLOR}:0.15:0.05[subkeyed];"
             f"[0:v][likekeyed]overlay=x=0:y=0:enable='between(t,0,{t_like_end:.2f})'[v1];"
-            f"[v1][subkeyed]overlay=x=0:y=0:enable='between(t,{t_like_end:.2f},{t_sub_end:.2f})'[vout]"
+            f"[v1][subkeyed]overlay=x=0:y=0:enable='between(t,{t_like_end:.2f},{t_sub_end:.2f})'[vout];"
+            f"[4:a]atrim=0:{total_duration:.2f},asetpts=PTS-STARTPTS,volume={MUSIC_VOLUME},"
+            f"afade=t=in:st=0:d={MUSIC_FADE_SECONDS},afade=t=out:st={fade_out_start:.2f}:d={MUSIC_FADE_SECONDS}[music];"
+            f"[3:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
         )
 
         output_path = os.path.join(workdir, f"{uuid.uuid4().hex}.mp4")
@@ -666,8 +678,9 @@ def _run_satisfying_job(job_id: str, req: "SatisfyingRenderRequest") -> None:
             "-i", like_path,
             "-itsoffset", f"{t_like_end:.2f}", "-i", subscribe_path,
             "-i", sped_path,
+            "-i", music_path,
             "-filter_complex", filter_complex,
-            "-map", "[vout]", "-map", "3:a",
+            "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
             "-c:a", "aac", "-b:a", "128k",
             "-t", str(total_duration),
